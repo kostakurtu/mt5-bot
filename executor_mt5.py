@@ -1,10 +1,17 @@
-"""MT5 execution layer: open market order, then modify SL/TP after delay."""
+# executor_mt5.py
+"""MT5 execution layer: open market order, then modify SL/TP after delay.
+
+Corrections:
+- Use the *position ticket* for TRADE_ACTION_SLTP (do NOT use order/deal id).
+- Prefer matching the opened position by magic + comment; fallback to most recent
+  position on the symbol.
+"""
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import MetaTrader5 as mt5
 
@@ -39,7 +46,12 @@ def ensure_symbol(symbol: str) -> None:
         raise RuntimeError(f"symbol_select failed {symbol}: {last_error_text()}")
 
 
-def connect(login: int | None = None, password: str | None = None, server: str | None = None, path: str | None = None) -> None:
+def connect(
+    login: int | None = None,
+    password: str | None = None,
+    server: str | None = None,
+    path: str | None = None,
+) -> None:
     ok = mt5.initialize(path=path) if path else mt5.initialize()
     if not ok:
         raise RuntimeError(f"mt5.initialize failed: {last_error_text()}")
@@ -80,6 +92,7 @@ def has_position(symbol: str) -> bool:
 
 
 def _send_with_fok_ioc_fallback(request: dict[str, Any]) -> Any:
+    """Try FOK, fallback to IOC."""
     request_fok = dict(request)
     request_fok["type_filling"] = mt5.ORDER_FILLING_FOK
     result = mt5.order_send(request_fok)
@@ -88,8 +101,35 @@ def _send_with_fok_ioc_fallback(request: dict[str, Any]) -> Any:
 
     request_ioc = dict(request)
     request_ioc["type_filling"] = mt5.ORDER_FILLING_IOC
-    result_ioc = mt5.order_send(request_ioc)
-    return result_ioc
+    return mt5.order_send(request_ioc)
+
+
+def _pick_position_ticket(symbol: str, magic: int, comment: str) -> Optional[int]:
+    """Return a position ticket for TRADE_ACTION_SLTP.
+
+    In MT5 Python, modifying SL/TP requires a *position ticket*.
+    order/deal ids are not reliable substitutes.
+    """
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return None
+
+    # Prefer magic + comment match
+    matched = []
+    for p in positions:
+        pmagic = getattr(p, "magic", None)
+        pcomment = getattr(p, "comment", "")
+        if pmagic == magic and (comment in pcomment):
+            matched.append(p)
+
+    if matched:
+        matched.sort(key=lambda x: getattr(x, "time", 0))
+        return int(matched[-1].ticket)
+
+    # Fallback: most recent position on the symbol
+    positions = list(positions)
+    positions.sort(key=lambda x: getattr(x, "time", 0))
+    return int(positions[-1].ticket)
 
 
 def open_market_then_modify(
@@ -108,9 +148,9 @@ def open_market_then_modify(
 
     is_buy = side.upper() == "BUY"
     order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-    entry = tick.ask if is_buy else tick.bid
+    entry = float(tick.ask if is_buy else tick.bid)
 
-    open_request = {
+    open_request: dict[str, Any] = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": float(lot),
@@ -126,27 +166,23 @@ def open_market_then_modify(
     if open_result is None or open_result.retcode not in SUCCESS_RETCODES:
         return open_result, None
 
+    # mimic human delay
     time.sleep(0.2)
 
     stop_level_price_dist = constraints.stops_level_points * constraints.point
     if abs(entry - sl) < stop_level_price_dist or abs(tp - entry) < stop_level_price_dist:
         return open_result, None
 
-    position_id = getattr(open_result, "order", 0) or getattr(open_result, "deal", 0)
-    if not position_id:
-        positions = mt5.positions_get(symbol=symbol)
-        if positions:
-            position_id = positions[0].ticket
-
-    if not position_id:
+    ticket = _pick_position_ticket(symbol=symbol, magic=magic, comment=comment)
+    if ticket is None:
         return open_result, None
 
-    modify_request = {
+    modify_request: dict[str, Any] = {
         "action": mt5.TRADE_ACTION_SLTP,
         "symbol": symbol,
-        "position": int(position_id),
-        "sl": round(sl, constraints.digits),
-        "tp": round(tp, constraints.digits),
+        "position": int(ticket),
+        "sl": round(float(sl), constraints.digits),
+        "tp": round(float(tp), constraints.digits),
         "magic": magic,
         "comment": comment,
     }
