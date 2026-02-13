@@ -162,4 +162,38 @@ def run_backtest(symbol: str, bars: int = 2000) -> None:
             sl_pips=sl_pips,
             tick_value=float(info.trade_tick_value),
             tick_size=float(info.trade_tick_size),
-            point=po
+            point=point,
+            digits=digits,
+            info=info,
+        )
+
+        print(
+            f"[BACKTEST] {symbol} {t} {side} lot={lot} "
+            f"entry={round(entry, digits)} sl={round(sl, digits)} tp={round(tp, digits)} "
+            f"sl_pips={sl_pips:.4f} spread={round(spread_price, digits)}"
+        )
+
+
+def self_check() -> None:
+    assert pip_size(0.00001, 5) == 0.0001
+    assert pip_size(0.001, 3) == 0.01
+    step = 0.01
+    lot = normalize_volume(0.127, 0.01, 100.0, step)
+    rem = round((lot / step) - round(lot / step), 8)
+    assert abs(rem) <= 1e-6
+
+
+def main() -> None:
+    self_check()
+    if not mt5.initialize():
+        raise RuntimeError("mt5.initialize failed")
+
+    try:
+        for symbol in [s.strip() for s in SYMBOLS_TO_TRADE.split(",") if s.strip()]:
+            run_backtest(symbol)
+    finally:
+        mt5.shutdown()
+
+
+if __name__ == "__main__":
+    main()
