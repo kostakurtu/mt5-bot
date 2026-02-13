@@ -1,167 +1,154 @@
+"""MT5 execution layer: open market order, then modify SL/TP after delay."""
+
 from __future__ import annotations
 
-import logging
-import math
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import MetaTrader5 as mt5
 
-LOGGER = logging.getLogger(__name__)
 
 SUCCESS_RETCODES = {
     mt5.TRADE_RETCODE_DONE,
-    mt5.TRADE_RETCODE_PLACED,
     mt5.TRADE_RETCODE_DONE_PARTIAL,
+    mt5.TRADE_RETCODE_PLACED,
 }
 
 
-def _log(msg: str) -> None:
-    print(msg)
-    LOGGER.info(msg)
+@dataclass(frozen=True)
+class SymbolConstraints:
+    point: float
+    digits: int
+    volume_min: float
+    volume_max: float
+    volume_step: float
+    stops_level_points: int
 
 
-def _last_error() -> dict[str, Any]:
-    code, message = mt5.last_error()
-    return {"code": code, "message": message}
+def last_error_text() -> str:
+    code, msg = mt5.last_error()
+    return f"{code}: {msg}"
 
 
-def _to_dict(obj: Any) -> dict[str, Any]:
-    if obj is None:
-        return {}
-    if hasattr(obj, "_asdict"):
-        return obj._asdict()
-    if isinstance(obj, dict):
-        return obj
-    return {"value": obj}
-
-
-def _order_response(result: Any, request: dict[str, Any] | None = None) -> dict[str, Any]:
-    res = _to_dict(result)
-    retcode = res.get("retcode")
-    ok = retcode in SUCCESS_RETCODES
-    response: dict[str, Any] = {
-        "ok": ok,
-        "retcode": retcode,
-        "order": res.get("order"),
-        "deal": res.get("deal"),
-        "price": res.get("price"),
-        "volume": res.get("volume"),
-        "request": request if request is not None else _to_dict(res.get("request")),
-        "comment": res.get("comment"),
-        "last_error": _last_error(),
-    }
-    if not ok:
-        response["reason"] = "ORDER_SEND_FAILED"
-        response["details"] = res
-    return response
-
-
-def _ensure_symbol(symbol: str) -> tuple[Any, Any]:
+def ensure_symbol(symbol: str) -> None:
     info = mt5.symbol_info(symbol)
     if info is None:
-        raise RuntimeError(f"symbol_info failed for {symbol}: {_last_error()}")
-
-    if not info.visible:
-        selected = mt5.symbol_select(symbol, True)
-        if not selected:
-            raise RuntimeError(f"symbol_select failed for {symbol}: {_last_error()}")
-        info = mt5.symbol_info(symbol)
-        if info is None:
-            raise RuntimeError(
-                f"symbol_info unavailable after selection for {symbol}: {_last_error()}"
-            )
-
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        raise RuntimeError(f"symbol_info_tick failed for {symbol}: {_last_error()}")
-    if tick.bid <= 0 or tick.ask <= 0:
-        raise RuntimeError(f"invalid tick for {symbol}: bid={tick.bid}, ask={tick.ask}")
-    return info, tick
+        raise RuntimeError(f"symbol_info failed {symbol}: {last_error_text()}")
+    if not info.visible and not mt5.symbol_select(symbol, True):
+        raise RuntimeError(f"symbol_select failed {symbol}: {last_error_text()}")
 
 
-def _norm_price(price: float, digits: int) -> float:
-    return round(float(price), int(digits))
-
-
-def _normalize_volume(
-    volume: float, volume_min: float, volume_max: float, volume_step: float
-) -> float:
-    if volume_step <= 0:
-        return volume
-    steps = math.floor((volume - volume_min) / volume_step)
-    normalized = volume_min + steps * volume_step
-    normalized = max(volume_min, min(normalized, volume_max))
-    precision = max(0, len(str(volume_step).split(".")[-1].rstrip("0")))
-    return round(normalized, precision)
-
-
-def mt5_connect(
-    login: int | None,
-    password: str | None,
-    server: str | None,
-    path: str | None,
-) -> tuple[bool, str]:
-    _log("Initializing MT5...")
-    ok_init = mt5.initialize(path=path) if path else mt5.initialize()
-    if not ok_init:
-        err = _last_error()
-        return False, f"mt5.initialize failed: {err}"
-
+def connect(login: int | None = None, password: str | None = None, server: str | None = None, path: str | None = None) -> None:
+    ok = mt5.initialize(path=path) if path else mt5.initialize()
+    if not ok:
+        raise RuntimeError(f"mt5.initialize failed: {last_error_text()}")
     if login is not None and password is not None and server is not None:
-        _log(f"Logging into MT5 account {login} on {server}...")
-        ok_login = mt5.login(login=login, password=password, server=server)
-        if not ok_login:
-            err = _last_error()
-            return False, f"mt5.login failed: {err}"
-
-    return True, "MT5 connected"
+        if not mt5.login(login=login, password=password, server=server):
+            raise RuntimeError(f"mt5.login failed: {last_error_text()}")
 
 
-def mt5_shutdown() -> None:
-    _log("Shutting down MT5...")
+def shutdown() -> None:
     mt5.shutdown()
 
 
-def symbol_specs(symbol: str) -> dict:
-    info, tick = _ensure_symbol(symbol)
-    point = float(info.point)
-    if point <= 0:
-        raise RuntimeError(f"invalid point value for {symbol}: point={point}")
+def get_constraints(symbol: str) -> SymbolConstraints:
+    ensure_symbol(symbol)
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        raise RuntimeError(f"symbol_info unavailable for {symbol}")
+    return SymbolConstraints(
+        point=float(info.point),
+        digits=int(info.digits),
+        volume_min=float(info.volume_min),
+        volume_max=float(info.volume_max),
+        volume_step=float(info.volume_step),
+        stops_level_points=int(info.trade_stops_level),
+    )
 
-    spread_points = (tick.ask - tick.bid) / point
-    ifuddan if spread_points < 0:
-        raise RuntimeError(f"invalid spread for {symbol}: bid={tick.bid}, ask={tick.ask}")
 
-    return {
-        "digits": int(info.digits),
-        "point": point,
-        "trade_tick_value": float(info.trade_tick_value),
-        "trade_tick_size": float(info.trade_tick_size),
-        "volume_min": float(info.volume_min),
-        "volume_max": float(info.volume_max),
-        "volume_step": float(info.volume_step),
-        "stops_level_points": int(info.trade_stops_level),
-        "spread_points": float(spread_points),
-        "trade_contract_size": float(getattr(info, "trade_contract_size", 0.0)),
-        "freeze_level_points": int(getattr(info, "trade_freeze_level", 0)),
+def symbol_tick(symbol: str) -> Any:
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise RuntimeError(f"symbol_info_tick failed {symbol}: {last_error_text()}")
+    return tick
+
+
+def has_position(symbol: str) -> bool:
+    positions = mt5.positions_get(symbol=symbol)
+    return positions is not None and len(positions) > 0
+
+
+def _send_with_fok_ioc_fallback(request: dict[str, Any]) -> Any:
+    request_fok = dict(request)
+    request_fok["type_filling"] = mt5.ORDER_FILLING_FOK
+    result = mt5.order_send(request_fok)
+    if result is not None and result.retcode in SUCCESS_RETCODES:
+        return result
+
+    request_ioc = dict(request)
+    request_ioc["type_filling"] = mt5.ORDER_FILLING_IOC
+    result_ioc = mt5.order_send(request_ioc)
+    return result_ioc
+
+
+def open_market_then_modify(
+    symbol: str,
+    side: str,
+    lot: float,
+    sl: float,
+    tp: float,
+    magic: int = 440040,
+    comment: str = "jackpot_m5",
+) -> tuple[Any, Any | None]:
+    """Open market order without SL/TP, then set SL/TP after 200ms if stop-level allows."""
+    ensure_symbol(symbol)
+    constraints = get_constraints(symbol)
+    tick = symbol_tick(symbol)
+
+    is_buy = side.upper() == "BUY"
+    order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+    entry = tick.ask if is_buy else tick.bid
+
+    open_request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(lot),
+        "type": order_type,
+        "price": round(entry, constraints.digits),
+        "deviation": 20,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
     }
 
+    open_result = _send_with_fok_ioc_fallback(open_request)
+    if open_result is None or open_result.retcode not in SUCCESS_RETCODES:
+        return open_result, None
 
-def get_spread_pips(symbol: str) -> float:
-    specs = symbol_specs(symbol)
-    digits = int(specs["digits"])
-    pip_factor = 10 if digits in (3, 5) else 1
-    return float(specs["spread_points"]) / pip_factor
+    time.sleep(0.2)
 
+    stop_level_price_dist = constraints.stops_level_points * constraints.point
+    if abs(entry - sl) < stop_level_price_dist or abs(tp - entry) < stop_level_price_dist:
+        return open_result, None
 
-if __name__ == "__main__":
-    ok, message = mt5_connect(login=None, password=None, server=None, path=None)
-    print("CONNECT:", ok, message)
-    if ok:
-        try:
-            specs = symbol_specs("EURUSD")
-            print("EURUSD SPECS:", specs)
-            spread = get_spread_pips("EURUSD")
-            print("EURUSD SPREAD (pips):", spread)
-        finally:
-            mt5_shutdown()
+    position_id = getattr(open_result, "order", 0) or getattr(open_result, "deal", 0)
+    if not position_id:
+        positions = mt5.positions_get(symbol=symbol)
+        if positions:
+            position_id = positions[0].ticket
+
+    if not position_id:
+        return open_result, None
+
+    modify_request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "position": int(position_id),
+        "sl": round(sl, constraints.digits),
+        "tp": round(tp, constraints.digits),
+        "magic": magic,
+        "comment": comment,
+    }
+    modify_result = mt5.order_send(modify_request)
+    return open_result, modify_result

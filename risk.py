@@ -1,77 +1,56 @@
-from dataclasses import dataclass
+"""Risk and position-sizing helpers for Jackpot M5 strategy."""
+
+from __future__ import annotations
+
 import math
 
 
-@dataclass(frozen=True)
-class PropRules:
-    risk_per_trade: float
-    max_trades_per_day: int
-    max_consec_losses: int
-    daily_kill_pct: float
-    max_dd_kill_pct: float
-    daily_soft_target_pct: float
-    spread_max_pips: float
+def pip_size(point: float, digits: int) -> float:
+    """Return pip size from symbol point/digits.
+
+    MQL5-equivalent behavior: for 5-digit/3-digit FX symbols, 1 pip = 10 points.
+    """
+    return point * 10.0 if int(digits) in (3, 5) else point
 
 
-@dataclass(frozen=True)
-class AccountSnapshot:
-    equity: float
-    balance: float
-    day_start_equity: float
-    peak_equity: float
-    trades_today: int
-    consec_losses_today: int
-    floating_pnl: float
+def normalize_volume(raw_lot: float, volume_min: float, volume_max: float, volume_step: float) -> float:
+    """Floor raw lot to broker step and clamp to [min, max]."""
+    if volume_step <= 0:
+        normalized = raw_lot
+    else:
+        steps = math.floor(raw_lot / volume_step)
+        normalized = steps * volume_step
+
+    normalized = max(volume_min, min(normalized, volume_max))
+
+    step_text = f"{volume_step:.10f}".rstrip("0")
+    precision = len(step_text.split(".")[1]) if "." in step_text else 0
+    return round(normalized, precision)
 
 
-def calc_lot_by_risk(
-    equity: float,
-    risk_pct: float,
-    entry: float,
-    sl: float,
-    specs: dict,
-):
-    point = float(specs["point"])
-    trade_tick_value = float(specs["trade_tick_value"])
-    trade_tick_size = float(specs["trade_tick_size"])
-    volume_min = float(specs["volume_min"])
-    volume_max = float(specs["volume_max"])
-    volume_step = float(specs["volume_step"])
+def compute_lot_by_risk(
+    balance: float,
+    risk_percent: float,
+    sl_pips: float,
+    tick_value: float,
+    tick_size: float,
+    point: float,
+    digits: int,
+    volume_min: float,
+    volume_max: float,
+    volume_step: float,
+) -> float:
+    """Compute lot size with MQL5-equivalent risk logic."""
+    if sl_pips <= 0:
+        raise ValueError("sl_pips must be > 0")
+    if tick_size <= 0:
+        raise ValueError("tick_size must be > 0")
 
-    sl_distance_price = abs(entry - sl)
-    if sl_distance_price <= 0:
-        raise ValueError("SL distance must be > 0")
+    risk_money = balance * (risk_percent / 100.0)
+    pips = pip_size(point=point, digits=digits)
+    pip_value_per_lot = (tick_value / tick_size) * pips
+    if pip_value_per_lot <= 0:
+        raise ValueError("pip_value_per_lot must be > 0")
 
-    risk_money = equity * risk_pct
-    sl_points = sl_distance_price / point
-    value_per_point_per_lot = (trade_tick_value / trade_tick_size) * point
-    raw_lot = risk_money / (sl_points * value_per_point_per_lot)
-
-    stepped_lot = math.floor(raw_lot / volume_step) * volume_step
-    normalized_lot = max(volume_min, min(stepped_lot, volume_max))
-
-    return round(normalized_lot, 2)
-
-
-def risk_gate(
-    rules: PropRules,
-    account: AccountSnapshot,
-    spread_pips: float,
-):
-    day_pnl_pct = (account.equity - account.day_start_equity) / account.day_start_equity
-    dd_pct = (account.equity - account.peak_equity) / account.peak_equity
-
-    if spread_pips > rules.spread_max_pips:
-        return False, "SPREAD_TOO_HIGH", {}
-    if account.trades_today >= rules.max_trades_per_day:
-        return False, "MAX_TRADES_REACHED", {}
-    if account.consec_losses_today >= rules.max_consec_losses:
-        return False, "MAX_CONSEC_LOSSES_REACHED", {}
-    if day_pnl_pct <= rules.daily_kill_pct:
-        return False, "DAILY_KILL_SWITCH", {}
-    if dd_pct <= rules.max_dd_kill_pct:
-        return False, "MAX_DD_KILL_SWITCH", {}
-    if day_pnl_pct >= rules.daily_soft_target_pct:
-        return False, "DAILY_TARGET_REACHED", {}
-
-    return True, "ALLOW", {}
+    raw_lot = risk_money / (sl_pips * pip_value_per_lot)
+    return normalize_volume(raw_lot, volume_min, volume_max, volume_step)
