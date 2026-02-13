@@ -1,3 +1,4 @@
+# risk.py  (inchangé - déjà correct)
 """Risk and position-sizing helpers for Jackpot M5 strategy."""
 
 from __future__ import annotations
